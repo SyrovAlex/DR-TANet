@@ -154,7 +154,7 @@ class ChangeDetectionTrainer:
             inputs = inputs.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True)
 
-            with autocast(enabled=self.use_amp):
+            with autocast(device_type='cuda', enabled=self.use_amp):
                 outputs = self.model(inputs)
             preds = torch.argmax(outputs, dim=1)
 
@@ -187,7 +187,7 @@ class ChangeDetectionTrainer:
             input_tensor, mask_gt = self.val_dataset[i]
             input_batch = input_tensor.unsqueeze(0).to(self.device, non_blocking=True)
 
-            with autocast(enabled=self.use_amp):
+            with autocast(device_type='cuda', enabled=self.use_amp):
                 output = self.model(input_batch)
 
             pred_mask = torch.argmax(output[0], dim=0).cpu().numpy()
