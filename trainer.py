@@ -3,6 +3,7 @@ import csv
 import cv2
 import torch
 import numpy as np
+import torch.nn as nn
 from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
 from torchmetrics.classification import BinaryF1Score, BinaryJaccardIndex
@@ -13,13 +14,13 @@ from loss import ChangeDetectionLoss
 
 
 class ChangeDetectionTrainer:
-    """Продвинутый тренер для DR-TANet / TANet с AMP, gradient clipping, TensorBoard и ранней остановкой"""
 
     def __init__(self, config):
         self.config = config
-        self.device = torch.device(config['device'] if torch.cuda.is_available() else 'cpu')
-        self.use_amp = config.get('use_amp', True)
+        self.device = torch.device(config['device'])
+        self.use_amp = config['use_amp']
         self.scaler = GradScaler(enabled=self.use_amp)
+        self.epoch = 0
 
         # === DataLoader ===
         self.train_dataset = PCD_Dataset(config['train_dir'])
@@ -34,7 +35,7 @@ class ChangeDetectionTrainer:
         )
         self.val_loader = torch.utils.data.DataLoader(
             self.val_dataset,
-            batch_size=config.get('val_batch_size', 1),
+            batch_size=config['val_batch_size'],
             shuffle=False,
             num_workers=1,
             pin_memory=True
@@ -44,9 +45,9 @@ class ChangeDetectionTrainer:
         self.model = TANet(
             encoder_arch=config['encoder_arch'],
             local_kernel_size=config['local_kernel_size'],
-            attn_stride=config['attn_stride'],
-            attn_padding=config['attn_padding'],
-            attn_groups=config['attn_groups'],
+            stride=config['attn_stride'],
+            padding=config['attn_padding'],
+            groups=config['attn_groups'],
             drtam=config['drtam'],
             refinement=config['refinement']
         ).to(self.device)
@@ -56,11 +57,9 @@ class ChangeDetectionTrainer:
             print(f"Используется {torch.cuda.device_count()} GPU")
 
         # === Loss ===
-        pos_weight = config.get('pos_weight', 1.0)
-        weight = torch.tensor([1.0, pos_weight]).to(self.device)
         self.criterion = ChangeDetectionLoss(
-            alpha=config.get('loss_alpha', 0.5),
-            gamma=config.get('focal_gamma', 2.0),
+            focal_alpha=config['focal_alpha'],
+            focal_gamma=config['focal_gamma'],
             use_focal=True,
             use_dice=True
         )
@@ -70,34 +69,23 @@ class ChangeDetectionTrainer:
             self.model.parameters(),
             lr=config['learning_rate'],
             betas=(0.9, 0.999),
-            weight_decay=config.get('weight_decay', 0.0)
+            weight_decay=config['weight_decay']
         )
 
-        # === Scheduler ===
+        # === Простой LinearLR: линейное затухание от base_lr до 0 за всё обучение ===
         total_steps = config['epochs'] * len(self.train_loader)
-        scheduler_type = config.get('scheduler', 'linear')
-        if scheduler_type == 'cosine':
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=config['epochs']
-            )
-        elif scheduler_type == 'step':
-            step_size = config.get('step_size', 30)
-            gamma = config.get('gamma', 0.1)
-            self.scheduler = torch.optim.lr_scheduler.StepLR(
-                self.optimizer, step_size=step_size, gamma=gamma
-            )
-        elif scheduler_type == 'linear':
-            self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-                self.optimizer,
-                lr_lambda=lambda step: max(0.0, 1.0 - step / total_steps)
-            )
-        else:
-            raise ValueError(f"Неизвестный scheduler: {scheduler_type}")
+        self.scheduler = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer,
+            start_factor=1.0,      # начинаем с base_lr
+            end_factor=0.0,        # заканчиваем на 0
+            total_iters=total_steps
+        )
+        print(f"Scheduler: LinearLR (затухание до 0 за {total_steps} шагов)")
 
         # === Ранняя остановка ===
         self.best_metric = -float('inf')
         self.patience_counter = 0
-        self.patience = config.get('patience', 10)
+        self.patience = config['patience']
 
         # === Логирование ===
         self.checkpoint_dir = config['checkpoint_dir']
@@ -107,7 +95,6 @@ class ChangeDetectionTrainer:
         print(f"Устройство: {self.device}")
         print(f"AMP: {'включён' if self.use_amp else 'выключен'}")
         print(f"Gradient clipping: {config.get('grad_clip', 0.0)}")
-        print(f"Scheduler: {scheduler_type}")
         print(f"Модель: {'DR-TANet' if config['drtam'] else 'TANet'}, Encoder: {config['encoder_arch']}")
 
     def train_epoch(self):
@@ -127,13 +114,12 @@ class ChangeDetectionTrainer:
 
                 self.optimizer.zero_grad()
 
-                with autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
+                with autocast(enabled=self.use_amp):
                     outputs = self.model(inputs)
                     loss = self.criterion(outputs, masks)
 
                 self.scaler.scale(loss).backward()
 
-                # Gradient clipping
                 grad_clip = self.config.get('grad_clip', 0.0)
                 if grad_clip > 0.0:
                     self.scaler.unscale_(self.optimizer)
@@ -141,6 +127,9 @@ class ChangeDetectionTrainer:
 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+
+                # === Шаг scheduler'а КАЖДЫЙ БАТЧ ===
+                self.scheduler.step()
 
                 loss_item = loss.item()
                 epoch_loss += loss_item
@@ -164,7 +153,7 @@ class ChangeDetectionTrainer:
             inputs = inputs.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True)
 
-            with autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
+            with autocast(enabled=self.use_amp):
                 outputs = self.model(inputs)
             preds = torch.argmax(outputs, dim=1)
 
@@ -197,12 +186,13 @@ class ChangeDetectionTrainer:
             input_tensor, mask_gt = self.val_dataset[i]
             input_batch = input_tensor.unsqueeze(0).to(self.device, non_blocking=True)
 
-            with autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
+            with autocast(enabled=self.use_amp):
                 output = self.model(input_batch)
 
             pred_mask = torch.argmax(output[0], dim=0).cpu().numpy()
             gt_mask = mask_gt.numpy()
 
+            input_tensor = input_tensor.numpy()
             img_t0 = np.transpose((input_tensor[0:3] + 1) * 128, (1, 2, 0)).astype(np.uint8)
             img_t1 = np.transpose((input_tensor[3:6] + 1) * 128, (1, 2, 0)).astype(np.uint8)
             pred_rgb = np.stack([pred_mask * 255] * 3, axis=-1).astype(np.uint8)
@@ -211,9 +201,9 @@ class ChangeDetectionTrainer:
             h, w = img_t0.shape[:2]
             canvas = np.zeros((2 * h, 2 * w, 3), dtype=np.uint8)
             canvas[0:h, 0:w] = img_t0
-            canvas[0:h, w:2*w] = img_t1
-            canvas[h:2*h, 0:w] = gt_rgb
-            canvas[h:2*h, w:2*w] = pred_rgb
+            canvas[0:h, w:2 * w] = img_t1
+            canvas[h:2 * h, 0:w] = gt_rgb
+            canvas[h:2 * h, w:2 * w] = pred_rgb
 
             cv2.imwrite(
                 os.path.join(sample_dir, f'sample_epoch{self.epoch:03d}_{i}.png'),
@@ -235,12 +225,6 @@ class ChangeDetectionTrainer:
                 metrics['global_f1'],
                 metrics['global_iou']
             ])
-
-        # TensorBoard
-        self.writer.add_scalar('Val/Mean_F1', metrics['mean_f1'], self.epoch)
-        self.writer.add_scalar('Val/Mean_IoU', metrics['mean_iou'], self.epoch)
-        self.writer.add_scalar('Val/Global_F1', metrics['global_f1'], self.epoch)
-        self.writer.add_scalar('Val/Global_IoU', metrics['global_iou'], self.epoch)
 
         print(
             f"[Val] Epoch {self.epoch + 1} | "
@@ -279,16 +263,17 @@ class ChangeDetectionTrainer:
 
         for self.epoch in range(self.epoch, self.config['epochs']):
             train_loss = self.train_epoch()
-            print(f"[Train] Epoch {self.epoch + 1} | Loss: {train_loss:.4f}")
+            current_lr = self.optimizer.param_groups[0]['lr']
+            print(f"[Train] Epoch {self.epoch + 1} | Loss: {train_loss:.4f} | LR: {current_lr:.2e}")
 
             # Валидация раз в N эпох
-            val_interval = self.config.get('val_interval', 1)
+            val_interval = self.config['val_interval']
             if (self.epoch + 1) % val_interval == 0:
                 val_metrics = self.compute_validation_metrics()
                 self.log_and_save_metrics(val_metrics)
 
                 # Визуализация
-                if (self.epoch + 1) % self.config.get('val_vis_interval', 5) == 0:
+                if (self.epoch + 1) % self.config['val_vis_interval'] == 0:
                     self.visualize_samples()
 
                 # Ранняя остановка (по mean IoU)
@@ -297,7 +282,7 @@ class ChangeDetectionTrainer:
                     self.best_metric = current_metric
                     self.patience_counter = 0
                     self.save_checkpoint(is_best=True)
-                    print(f"🏆 Новый рекорд! Mean IoU: {current_metric:.4f}")
+                    print(f"Новый рекорд! Mean IoU: {current_metric:.4f}")
                 else:
                     self.patience_counter += 1
 
@@ -305,14 +290,9 @@ class ChangeDetectionTrainer:
                 self.save_checkpoint()
 
                 if self.patience_counter >= self.patience:
-                    print(f"⏹️ Ранняя остановка на эпохе {self.epoch + 1}")
+                    print(f"Ранняя остановка на эпохе {self.epoch + 1}")
                     break
 
-            # Шаг scheduler'а (если не linear по шагам)
-            if self.config.get('scheduler', 'linear') != 'linear':
-                self.scheduler.step()
-
-        self.writer.close()
         print("✅ Обучение завершено.")
 
 
