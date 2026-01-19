@@ -5,7 +5,8 @@ import torch
 import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
-from torch.cuda.amp import autocast, GradScaler
+#from torch.cuda.amp import GradScaler
+from torch.amp import autocast, GradScaler
 from torchmetrics.classification import BinaryF1Score, BinaryJaccardIndex
 
 from TANet import TANet
@@ -114,7 +115,7 @@ class ChangeDetectionTrainer:
 
                 self.optimizer.zero_grad()
 
-                with autocast(enabled=self.use_amp):
+                with autocast(device_type='cuda', enabled=self.use_amp):
                     outputs = self.model(inputs)
                     loss = self.criterion(outputs, masks)
 
