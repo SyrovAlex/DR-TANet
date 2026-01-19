@@ -61,24 +61,3 @@ def export_to_onnx(checkpoint_path, onnx_path, input_shape=(1, 6, 256, 256), ops
         verbose=False
     )
     print(f"✅ Модель успешно экспортирована в {onnx_path}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Экспорт TANet в ONNX")
-    parser.add_argument("--checkpoint", required=True, help="Путь к .pth чекпоинту (например, best.pth)")
-    parser.add_argument("--onnx", required=True, help="Путь для сохранения .onnx файла")
-    parser.add_argument("--height", type=int, default=256, help="Высота входного изображения")
-    parser.add_argument("--width", type=int, default=256, help="Ширина входного изображения")
-    parser.add_argument("--batch", type=int, default=1, help="Размер батча (обычно 1 для инференса)")
-    parser.add_argument("--opset", type=int, default=13, choices=[11, 12, 13, 14, 15, 16, 17], help="ONNX opset version")
-
-    args = parser.parse_args()
-
-    input_shape = (args.batch, 6, args.height, args.width)  # 6 каналов: [img_t0, img_t1] по 3 канала
-
-    export_to_onnx(
-        checkpoint_path=args.checkpoint,
-        onnx_path=args.onnx,
-        input_shape=input_shape,
-        opset=args.opset
-    )

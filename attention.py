@@ -3,11 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 
-import onnx
-import onnxruntime as ort
-import numpy as np
-
-
 def unfold_vertical(x, kernel_size, stride=1):
     """Эквивалент x.unfold(2, kernel_size, stride)"""
     B, C, H, W = x.shape
@@ -130,9 +125,6 @@ class Temporal_Attention(nn.Module):
             out += torch.einsum('bnhwk,bnchwk -> bnchw', out_col_weights, v_out_col).contiguous().view(batch, -1, h, w)
 
         return out
-
-if __name__ == '__main__':
-    model = TANet(in_channels=3, out_channels=3, kernel_size=3, stride=1, padding=1)
 
 
 
